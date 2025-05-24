@@ -8,12 +8,14 @@ import scipy
 from sklearn import metrics
 import csv
 from tqdm import tqdm
-
+from barlow_loss import barlow_twins_loss
+from utils import augment_data
 from networks.base_model import BaseModel
 from networks.dcase2023t2_ae.network import AENet
 from networks.criterion.mahala import cov_v, loss_function_mahala, calc_inv_cov
 from tools.plot_anm_score import AnmScoreFigData
 from tools.plot_loss_curve import csv_to_figdata
+
 
 class DCASE2023T2AE(BaseModel):
     def __init__(self, args, train, test):
@@ -22,25 +24,26 @@ class DCASE2023T2AE(BaseModel):
             train=train,
             test=test
         )
-        parameter_list = [{"params":self.model.parameters()}]
+        parameter_list = [{"params": self.model.parameters()}]
         self.optimizer = optim.Adam(parameter_list, lr=self.args.learning_rate)
-        self.mse_score_distr_file_path = self.model_dir/f"score_distr_{self.args.model}_{self.args.dataset}{self.model_name_suffix}{self.eval_suffix}_seed{self.args.seed}_mse.pickle"
-        self.mahala_score_distr_file_path = self.model_dir/f"score_distr_{self.args.model}_{self.args.dataset}{self.model_name_suffix}{self.eval_suffix}_seed{self.args.seed}_mahala.pickle"
-
+        self.mse_score_distr_file_path = self.model_dir / \
+            f"score_distr_{self.args.model}_{self.args.dataset}{self.model_name_suffix}{self.eval_suffix}_seed{self.args.seed}_mse.pickle"
+        self.mahala_score_distr_file_path = self.model_dir / \
+            f"score_distr_{self.args.model}_{self.args.dataset}{self.model_name_suffix}{self.eval_suffix}_seed{self.args.seed}_mahala.pickle"
 
     def init_model(self):
         self.block_size = self.data.height
         return AENet(input_dim=self.data.input_dim, block_size=self.block_size)
 
     def get_log_header(self):
-        self.column_heading_list=[
-                ["loss"],
-                ["val_loss"],
-                ["recon_loss"], 
-                ["recon_loss_source", "recon_loss_target"],
+        self.column_heading_list = [
+            ["loss"],
+            ["val_loss"],
+            ["recon_loss"],
+            ["recon_loss_source", "recon_loss_target"],
         ]
         return "loss,val_loss,recon_loss,recon_loss_source,recon_loss_target"
-    
+
     def train(self, epoch):
         if epoch <= self.epoch:
             return
@@ -58,10 +61,8 @@ class DCASE2023T2AE(BaseModel):
             is_calc_cov = True
             self.model.eval()
             torch.set_grad_enabled(False)
-            # initialize mahalanobis param
-            cov_x_source = np.zeros((self.block_size, self.block_size))
-            cov_x_source = torch.from_numpy(cov_x_source)
-            cov_x_source = cov_x_source.to(self.device).float()
+            cov_x_source = torch.zeros(
+                (self.block_size, self.block_size), device=self.device)
             cov_x_target = cov_x_source.clone().detach()
             num_source = 0
             num_target = 0
@@ -71,13 +72,11 @@ class DCASE2023T2AE(BaseModel):
             is_calc_cov = False
 
         for batch_idx, batch in enumerate(tqdm(train_loader)):
-            data = batch[0]
-            data = data.to(self.device).float()
+            data = batch[0].to(self.device).float()
             if data.shape[0] <= 1:
                 continue
             data_name_list = batch[3]
-            machine_id = torch.argmax(batch[2], dim=1).long()
-            machine_id = machine_id.to(self.device)
+            machine_id = torch.argmax(batch[2], dim=1).long().to(self.device)
 
             is_target_list = ["target" in data_name for data_name in data_name_list]
             is_source_list = np.logical_not(is_target_list).tolist()
@@ -86,7 +85,14 @@ class DCASE2023T2AE(BaseModel):
 
             if not is_calc_cov:
                 self.optimizer.zero_grad()
-            recon_batch, z = self.model(data)
+
+        # === Forward Pass ===
+            recon_batch, z_orig = self.model(data)
+
+        # === Data Augmentation for Contrastive Learning ===
+            data_aug_1, data_aug_2 = augment_data(data)
+            recon_batch_aug1, z_aug1 = self.model(data_aug_1)
+            recon_batch_aug2, z_aug2 = self.model(data_aug_2)
 
             if is_calc_cov:
                 score_2d, cov_diff_source, cov_diff_target = loss_function_mahala(
@@ -98,54 +104,40 @@ class DCASE2023T2AE(BaseModel):
                     is_source_list=is_source_list,
                     is_target_list=is_target_list
                 )
-                cov_x_source_batch = cov_v(
-                    diff=cov_diff_source,
-                    num=1
-                )
-                cov_x_source += cov_x_source_batch.clone().detach()
+                cov_x_source += cov_v(diff=cov_diff_source, num=1).clone().detach()
                 num_source += n_source
                 if n_target > 0:
-                    cov_x_target_batch = cov_v(
-                        diff=cov_diff_target,
-                        num=1
-                    )
-                    cov_x_target += cov_x_target_batch.clone().detach()
+                    cov_x_target += cov_v(diff=cov_diff_target,num=1).clone().detach()
                     num_target += n_target
             else:
-                score_2d = self.loss_fn(
-                    recon_batch,
-                    data
-                )
-            
-            # loss reduction
+                score_2d = self.loss_fn(recon_batch, data)
+                contrastive_loss = barlow_twins_loss(z_orig, z_aug)
+
+        # === Loss Reduction ===
             n_loss = len(score_2d)
             score = self.loss_reduction_1d(score=score_2d)
-
             recon_loss = self.loss_reduction(score=score, n_loss=n_loss)
             recon_loss_source = self.loss_reduction(score=score[is_source_list], n_loss=n_source)
-            if n_target > 0:
-                recon_loss_target = self.loss_reduction(score=score[is_target_list], n_loss=n_target)
-            else:
-                recon_loss_target = 0
-            
-            self.loss = recon_loss
+            recon_loss_target = self.loss_reduction(score=score[is_target_list], n_loss=n_target) if n_target > 0 else 0
+
             if not is_calc_cov:
+                self.loss = recon_loss + 0.05 * contrastive_loss  # 0.05 is weighting factor
                 self.loss.backward()
                 self.optimizer.step()
+            else:
+                self.loss = recon_loss  # Only needed to record loss; no backward
+
             train_loss += float(self.loss)
             train_recon_loss += float(recon_loss)
             train_recon_loss_source += float(recon_loss_source)
             train_recon_loss_target += float(recon_loss_target)
-
             
-            # calculate y_pred for fitting anomaly score distribution
             y_pred.append(self.loss.item())
 
             if batch_idx % self.args.log_interval == 0 and not is_calc_cov:
                 print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                     epoch, batch_idx * len(data), len(train_loader.dataset),
-                    100. * batch_idx / len(train_loader),
-                    self.loss.item()))
+                    100. * batch_idx / len(train_loader), self.loss.item()))
 
         if is_calc_cov:
             # save cov_x
@@ -236,6 +228,7 @@ class DCASE2023T2AE(BaseModel):
             'loss':self.loss
         }, self.checkpoint_path)
 
+
     def calc_valid_mahala_score(self, data, y_pred, inv_cov_source, inv_cov_target):
         data = data.to(self.device).float()
         recon_data, _ = self.model(data)
@@ -247,7 +240,8 @@ class DCASE2023T2AE(BaseModel):
             use_precision=True,
             reduction=False
         )
-        loss_source = self.loss_reduction(score=self.loss_reduction_1d(loss_source), n_loss=num)
+        loss_source = self.loss_reduction(
+            score=self.loss_reduction_1d(loss_source), n_loss=num)
 
         loss_target, num = loss_function_mahala(
             recon_x=recon_data,
@@ -257,7 +251,8 @@ class DCASE2023T2AE(BaseModel):
             use_precision=True,
             reduction=False
         )
-        loss_target = self.loss_reduction(score=self.loss_reduction_1d(loss_target), n_loss=num)
+        loss_target = self.loss_reduction(
+            score=self.loss_reduction_1d(loss_target), n_loss=num)
         y_pred.append(min(loss_target.item(), loss_source.item()))
         return y_pred
 
@@ -267,7 +262,7 @@ class DCASE2023T2AE(BaseModel):
     def loss_reduction(self, score, n_loss):
         return torch.sum(score) / n_loss
 
-    def loss_fn(self,recon_x, x):
+    def loss_fn(self, recon_x, x):
         ### MSE loss ###
         loss = F.mse_loss(recon_x, x.view(recon_x.shape), reduction="none")
         return loss
@@ -295,10 +290,12 @@ class DCASE2023T2AE(BaseModel):
         self.model.eval()
 
         if self.args.score == "MAHALA":
-            decision_threshold = self.calc_decision_threshold(score_distr_file_path=self.mahala_score_distr_file_path)
+            decision_threshold = self.calc_decision_threshold(
+                score_distr_file_path=self.mahala_score_distr_file_path)
         else:
-            decision_threshold = self.calc_decision_threshold(score_distr_file_path=self.mse_score_distr_file_path)
-        
+            decision_threshold = self.calc_decision_threshold(
+                score_distr_file_path=self.mse_score_distr_file_path)
+
         dir_name = "test"
         inv_cov_source, inv_cov_target = calc_inv_cov(
             model=self.model,
@@ -309,11 +306,13 @@ class DCASE2023T2AE(BaseModel):
             result_dir = self.result_dir if self.args.dev else self.eval_data_result_dir
 
             # setup anomaly score file path
-            anomaly_score_csv = result_dir/f"anomaly_score_{self.args.dataset}_{section_name}_{dir_name}_seed{self.args.seed}{self.model_name_suffix}{self.eval_suffix}.csv"
+            anomaly_score_csv = result_dir / \
+                f"anomaly_score_{self.args.dataset}_{section_name}_{dir_name}_seed{self.args.seed}{self.model_name_suffix}{self.eval_suffix}.csv"
             anomaly_score_list = []
 
             # setup decision result file path
-            decision_result_csv = result_dir/f"decision_result_{self.args.dataset}_{section_name}_{dir_name}_seed{self.args.seed}{self.model_name_suffix}{self.eval_suffix}.csv"
+            decision_result_csv = result_dir / \
+                f"decision_result_{self.args.dataset}_{section_name}_{dir_name}_seed{self.args.seed}{self.model_name_suffix}{self.eval_suffix}.csv"
             decision_result_list = []
 
             domain_list = None
@@ -324,7 +323,7 @@ class DCASE2023T2AE(BaseModel):
             y_pred = []
             y_true = []
             test_loader = test_loader_tmp
-            
+
             with torch.no_grad():
                 y_pred, anomaly_score_list, decision_result_list, domain_list = self.eval(
                     test_loader=test_loader,
@@ -340,35 +339,49 @@ class DCASE2023T2AE(BaseModel):
                 )
 
             # output anomaly scores
-            save_csv(save_file_path=anomaly_score_csv, save_data=anomaly_score_list)
+            save_csv(save_file_path=anomaly_score_csv,
+                     save_data=anomaly_score_list)
             print("anomaly score result ->  {}".format(anomaly_score_csv))
 
             # output decision results
-            save_csv(save_file_path=decision_result_csv, save_data=decision_result_list)
+            save_csv(save_file_path=decision_result_csv,
+                     save_data=decision_result_list)
             print("decision result ->  {}".format(decision_result_csv))
 
             if mode:
                 # extract scores for calculation of AUC (source) and AUC (target)
-                y_true_s_auc = [y_true[idx] for idx in range(len(y_true)) if domain_list[idx]=="source" or y_true[idx]==1]
-                y_pred_s_auc = [y_pred[idx] for idx in range(len(y_true)) if domain_list[idx]=="source" or y_true[idx]==1]
-                y_true_t_auc = [y_true[idx] for idx in range(len(y_true)) if domain_list[idx]=="target" or y_true[idx]==1]
-                y_pred_t_auc = [y_pred[idx] for idx in range(len(y_true)) if domain_list[idx]=="target" or y_true[idx]==1]
+                y_true_s_auc = [y_true[idx] for idx in range(
+                    len(y_true)) if domain_list[idx] == "source" or y_true[idx] == 1]
+                y_pred_s_auc = [y_pred[idx] for idx in range(
+                    len(y_true)) if domain_list[idx] == "source" or y_true[idx] == 1]
+                y_true_t_auc = [y_true[idx] for idx in range(
+                    len(y_true)) if domain_list[idx] == "target" or y_true[idx] == 1]
+                y_pred_t_auc = [y_pred[idx] for idx in range(
+                    len(y_true)) if domain_list[idx] == "target" or y_true[idx] == 1]
 
                 # extract scores for calculation of precision, recall, F1 score for each domain
-                y_true_s = [y_true[idx] for idx in range(len(y_true)) if domain_list[idx]=="source"]
-                y_pred_s = [y_pred[idx] for idx in range(len(y_true)) if domain_list[idx]=="source"]
-                y_true_t = [y_true[idx] for idx in range(len(y_true)) if domain_list[idx]=="target"]
-                y_pred_t = [y_pred[idx] for idx in range(len(y_true)) if domain_list[idx]=="target"]
+                y_true_s = [y_true[idx] for idx in range(
+                    len(y_true)) if domain_list[idx] == "source"]
+                y_pred_s = [y_pred[idx] for idx in range(
+                    len(y_true)) if domain_list[idx] == "source"]
+                y_true_t = [y_true[idx] for idx in range(
+                    len(y_true)) if domain_list[idx] == "target"]
+                y_pred_t = [y_pred[idx] for idx in range(
+                    len(y_true)) if domain_list[idx] == "target"]
 
-
-                # calculate AUC, pAUC, precision, recall, F1 score 
+                # calculate AUC, pAUC, precision, recall, F1 score
                 auc_s = metrics.roc_auc_score(y_true_s_auc, y_pred_s_auc)
-                p_auc = metrics.roc_auc_score(y_true, y_pred, max_fpr=self.args.max_fpr)
-                p_auc_s = metrics.roc_auc_score(y_true_s, y_pred_s, max_fpr=self.args.max_fpr)
-                tn_s, fp_s, fn_s, tp_s = metrics.confusion_matrix(y_true_s, [1 if x > decision_threshold else 0 for x in y_pred_s]).ravel()
+                p_auc = metrics.roc_auc_score(
+                    y_true, y_pred, max_fpr=self.args.max_fpr)
+                p_auc_s = metrics.roc_auc_score(
+                    y_true_s, y_pred_s, max_fpr=self.args.max_fpr)
+                tn_s, fp_s, fn_s, tp_s = metrics.confusion_matrix(
+                    y_true_s, [1 if x > decision_threshold else 0 for x in y_pred_s]).ravel()
                 prec_s = tp_s / np.maximum(tp_s + fp_s, sys.float_info.epsilon)
-                recall_s = tp_s / np.maximum(tp_s + fn_s, sys.float_info.epsilon)
-                f1_s = 2.0 * prec_s * recall_s / np.maximum(prec_s + recall_s, sys.float_info.epsilon)
+                recall_s = tp_s / \
+                    np.maximum(tp_s + fn_s, sys.float_info.epsilon)
+                f1_s = 2.0 * prec_s * recall_s / \
+                    np.maximum(prec_s + recall_s, sys.float_info.epsilon)
 
                 anm_score_figdata.append_figdata(anm_score_figdata.anm_score_to_figdata(
                     scores=[[t, p] for t, p in zip(y_true_s, y_pred_s)],
@@ -384,18 +397,26 @@ class DCASE2023T2AE(BaseModel):
 
                 if len(y_true_t) > 0:
                     auc_t = metrics.roc_auc_score(y_true_t_auc, y_pred_t_auc)
-                    p_auc_t = metrics.roc_auc_score(y_true_t, y_pred_t, max_fpr=self.args.max_fpr)
-                    tn_t, fp_t, fn_t, tp_t = metrics.confusion_matrix(y_true_t, [1 if x > decision_threshold else 0 for x in y_pred_t]).ravel()
-                    prec_t = tp_t / np.maximum(tp_t + fp_t, sys.float_info.epsilon)
-                    recall_t = tp_t / np.maximum(tp_t + fn_t, sys.float_info.epsilon)
-                    f1_t = 2.0 * prec_t * recall_t / np.maximum(prec_t + recall_t, sys.float_info.epsilon)
+                    p_auc_t = metrics.roc_auc_score(
+                        y_true_t, y_pred_t, max_fpr=self.args.max_fpr)
+                    tn_t, fp_t, fn_t, tp_t = metrics.confusion_matrix(
+                        y_true_t, [1 if x > decision_threshold else 0 for x in y_pred_t]).ravel()
+                    prec_t = tp_t / \
+                        np.maximum(tp_t + fp_t, sys.float_info.epsilon)
+                    recall_t = tp_t / \
+                        np.maximum(tp_t + fn_t, sys.float_info.epsilon)
+                    f1_t = 2.0 * prec_t * recall_t / \
+                        np.maximum(prec_t + recall_t, sys.float_info.epsilon)
                     if len(csv_lines) == 0:
-                        csv_lines.append(self.result_column_dict["source_target"])
+                        csv_lines.append(
+                            self.result_column_dict["source_target"])
                     csv_lines.append([section_name.split("_", 1)[1],
-                                    auc_s, auc_t, p_auc, p_auc_s, p_auc_t, prec_s, prec_t, recall_s, recall_t, f1_s, f1_t])
+                                      auc_s, auc_t, p_auc, p_auc_s, p_auc_t, prec_s, prec_t, recall_s, recall_t, f1_s, f1_t])
 
-                    performance.append([auc_s, auc_t, p_auc, p_auc_s, p_auc_t, prec_s, prec_t, recall_s, recall_t, f1_s, f1_t])
-                    performance_over_all.append([auc_s, auc_t, p_auc, p_auc_s, p_auc_t, prec_s, prec_t, recall_s, recall_t, f1_s, f1_t])
+                    performance.append(
+                        [auc_s, auc_t, p_auc, p_auc_s, p_auc_t, prec_s, prec_t, recall_s, recall_t, f1_s, f1_t])
+                    performance_over_all.append(
+                        [auc_s, auc_t, p_auc, p_auc_s, p_auc_t, prec_s, prec_t, recall_s, recall_t, f1_s, f1_t])
 
                     anm_score_figdata.append_figdata(anm_score_figdata.anm_score_to_figdata(
                         scores=[[t, p] for t, p in zip(y_true_t, y_pred_t)],
@@ -408,35 +429,41 @@ class DCASE2023T2AE(BaseModel):
                     print("F1 score (target) : {}".format(f1_t))
                 else:
                     if len(csv_lines) == 0:
-                        csv_lines.append(self.result_column_dict["single_domain"])
-                    csv_lines.append([section_name.split("_", 1)[1], auc_s, p_auc, prec_s, recall_s, f1_s])
+                        csv_lines.append(
+                            self.result_column_dict["single_domain"])
+                    csv_lines.append([section_name.split("_", 1)[
+                                     1], auc_s, p_auc, prec_s, recall_s, f1_s])
 
                     performance.append([auc_s, p_auc, prec_s, recall_s, f1_s])
-                    performance_over_all.append([auc_s, p_auc, prec_s, recall_s, f1_s])
+                    performance_over_all.append(
+                        [auc_s, p_auc, prec_s, recall_s, f1_s])
 
-            
             print("\n============ END OF TEST FOR A SECTION ============")
 
         if mode:
             # calculate averages for AUCs and pAUCs
-            amean_performance = np.mean(np.array(performance, dtype=float), axis=0)
+            amean_performance = np.mean(
+                np.array(performance, dtype=float), axis=0)
             csv_lines.append(["arithmetic mean"] + list(amean_performance))
-            hmean_performance = scipy.stats.hmean(np.maximum(np.array(performance, dtype=float), sys.float_info.epsilon), axis=0)
+            hmean_performance = scipy.stats.hmean(np.maximum(
+                np.array(performance, dtype=float), sys.float_info.epsilon), axis=0)
             csv_lines.append(["harmonic mean"] + list(hmean_performance))
             csv_lines.append([])
 
             # output results
             anm_score_figdata.show_fig(
-                title=self.args.model+"_"+self.args.dataset+self.model_name_suffix+self.eval_suffix+"_anm_score",
+                title=self.args.model+"_"+self.args.dataset +
+                self.model_name_suffix+self.eval_suffix+"_anm_score",
                 export_dir=result_dir
             )
         else:
             return
-        
-        result_path = result_dir/f"result_{self.args.dataset}_{dir_name}_seed{self.args.seed}{self.model_name_suffix}{self.eval_suffix}_roc.csv"
+
+        result_path = result_dir / \
+            f"result_{self.args.dataset}_{dir_name}_seed{self.args.seed}{self.model_name_suffix}{self.eval_suffix}_roc.csv"
         print("results -> {}".format(result_path))
         save_csv(save_file_path=result_path, save_data=csv_lines)
-   
+
     def eval(
         self,
         test_loader,
@@ -467,7 +494,8 @@ class DCASE2023T2AE(BaseModel):
                     use_precision=True,
                     reduction=False
                 )
-                loss_source = self.loss_reduction(score=self.loss_reduction_1d(loss_source), n_loss=num)
+                loss_source = self.loss_reduction(
+                    score=self.loss_reduction_1d(loss_source), n_loss=num)
 
                 loss_target, num = loss_function_mahala(
                     recon_x=recon_data,
@@ -477,11 +505,13 @@ class DCASE2023T2AE(BaseModel):
                     use_precision=True,
                     reduction=False
                 )
-                loss_target = self.loss_reduction(score=self.loss_reduction_1d(loss_target), n_loss=num)
+                loss_target = self.loss_reduction(
+                    score=self.loss_reduction_1d(loss_target), n_loss=num)
                 y_pred.append(min(loss_target.item(), loss_source.item()))
             else:
-                y_pred.append(self.loss_fn(recon_x=recon_data, x=data).mean().item())
-            
+                y_pred.append(self.loss_fn(
+                    recon_x=recon_data, x=data).mean().item())
+
             # store anomaly scores
             anomaly_score_list.append([basename, y_pred[-1]])
 
@@ -492,8 +522,10 @@ class DCASE2023T2AE(BaseModel):
                 decision_result_list.append([basename, 0])
 
             if mode:
-                domain_list.append("target" if "target" in basename else "source")
+                domain_list.append(
+                    "target" if "target" in basename else "source")
         return y_pred, anomaly_score_list, decision_result_list, domain_list
+
 
 def save_csv(save_file_path,
              save_data):
