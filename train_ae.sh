@@ -1,3 +1,5 @@
+#!/bin/bash
+
 echo $*
 
 dataset=$1
@@ -15,13 +17,17 @@ echo id ${id}
 
 tag="id("
 for i in ${id}; do
-tag="${tag}${i}_"
+    tag="${tag}${i}_"
 done
 tag="${tag})"
 
-python3 train.py \
+# Ensure Python is found
+export PATH="/c/Python312:$PATH"
+
+# Run Python training script using full path
+/c/Python312/python train.py \
     --dataset=${dataset} \
     ${dev_eval} \
     -tag=${tag} \
     --use_ids ${id} \
-    --train_only \
+    --train_only

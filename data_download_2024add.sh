@@ -19,7 +19,7 @@ for machine_type in \
     RoboticArm_train_r2 \
     BrushlessMotor_train \
 ; do
-wget "https://zenodo.org/records/11259435/files/eval_data_${machine_type}.zip"
+curl -L -O "https://zenodo.org/records/11259435/files/eval_data_${machine_type}.zip"
 unzip "eval_data_${machine_type}.zip"
 done
 
