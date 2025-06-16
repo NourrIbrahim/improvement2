@@ -28,20 +28,16 @@ job="train_ae.sh"
 
 if [ "${dev_eval}" = "-d" ] || [ "${dev_eval}" = "--dev" ]
 then
-    dataset_list="DCASE2024T2bearing DCASE2024T2fan DCASE2024T2gearbox DCASE2024T2slider DCASE2024T2ToyCar DCASE2024T2ToyTrain DCASE2024T2valve"
+    dataset_list=" DCASE2024T2fan  DCASE2024T2slider "
 elif [ "${dev_eval}" = "-e" ] || [ "${dev_eval}" = "--eval" ]
 then
-    dataset_list="\
-        DCASE2024T23DPrinter \
-        DCASE2024T2AirCompressor \
-        DCASE2024T2Scanner \
-        DCASE2024T2ToyCircuit \
-        DCASE2024T2HoveringDrone \
+     dataset_list="\
+       
         DCASE2024T2HairDryer \
-        DCASE2024T2ToothBrush \
-        DCASE2024T2RoboticArm \
-        DCASE2024T2BrushlessMotor \
+       
     "
+
+
 
 fi
 
